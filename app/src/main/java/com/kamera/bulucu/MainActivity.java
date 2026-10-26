@@ -158,7 +158,7 @@ public class MainActivity extends Activity {
         hint.setTextColor(0xFF9E9E9E);
         hint.setTextSize(13);
         hint.setGravity(Gravity.CENTER);
-        hint.setText("Telefonu yere 30–60 cm yükseklikte tutup yavaşça gezdir. Yeşil kutu, halıdan farklı görünen şeyi gösterir.");
+        hint.setText("Kamerayı aradığın yüzeye (yer, halı, masa, koltuk…) 20–60 cm uzaktan tutup yavaşça gezdir. Yeşil kutu, yüzeyden farklı görünen küçük şeyi gösterir.");
         panel.addView(hint);
 
         root.addView(panel);
@@ -199,7 +199,7 @@ public class MainActivity extends Activity {
             retryBtn.setVisibility(View.GONE);
             startWhenReady();
         } else {
-            setStatus("Yerdeki şeyleri bulmak için kamera izni gerekli.");
+            setStatus("Düşen şeyleri bulmak için kamera izni gerekli.");
             retryBtn.setVisibility(View.VISIBLE);
         }
     }
@@ -390,7 +390,7 @@ public class MainActivity extends Activity {
                     if (camera == null) return;
                     session = s;
                     repeat();
-                    setStatus("Taranıyor… kamerayı yere tutup yavaşça gezdir.");
+                    setStatus("Taranıyor… kamerayı yüzeyde yavaşça gezdir.");
                 }
 
                 @Override
@@ -481,9 +481,9 @@ public class MainActivity extends Activity {
         main.post(() -> {
             overlay.setBoxes(boxes);
             if (busy && boxes.isEmpty()) {
-                setStatus("Zemin çok karışık görünüyor — biraz yaklaş ya da hassasiyeti düşür.");
+                setStatus("Yüzey çok karışık görünüyor — biraz yaklaş ya da hassasiyeti düşür.");
             } else if (boxes.isEmpty()) {
-                setStatus("Taranıyor… kamerayı yere tutup yavaşça gezdir.");
+                setStatus("Taranıyor… kamerayı yüzeyde yavaşça gezdir.");
             } else {
                 setStatus(boxes.size() == 1 ? "Bir şey bulundu! Yeşil kutuya bak." : boxes.size() + " şey bulundu! Yeşil kutulara bak.");
             }

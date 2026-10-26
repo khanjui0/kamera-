@@ -5,12 +5,14 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Finds small things that look different from the floor around them.
+ * Finds small things that look different from the surface around them: a carpet, a concrete
+ * floor, a table top, a car seat.
  *
  * Works on a low-resolution Y/U/V grid. Each cell is compared with the average of a large
- * neighbourhood (the "floor"), the difference is scaled by how much the floor itself normally
+ * neighbourhood (the surface), the difference is scaled by how much the surface itself normally
  * varies, and connected regions of cells that stand out are reported as boxes. Big regions are
- * dropped because they are carpet patterns, shadows or furniture rather than a lost object.
+ * dropped because they are patterns, shadows or furniture rather than a lost object, and so are
+ * bits of lines (seams, wood grain, cracks) that carry on past the region.
  * Plain Java so it can be tested off the device.
  */
 public final class FloorDetector {
@@ -92,7 +94,7 @@ public final class FloorDetector {
         float t = threshold();
         score();
 
-        // Second pass: leave out what already stands out, so an object doesn't tint its own floor.
+        // Second pass: leave out what already stands out, so an object doesn't tint its own surface.
         for (int i = 0; i < n; i++) weight[i] = z[i] > t * 0.5f ? 0f : 1f;
         for (int c = 0; c < 3; c++) boxBlur(fineCh[c], weight, bgRadius, bgCh[c]);
         score();
@@ -102,7 +104,7 @@ public final class FloorDetector {
 
     private static final float[] MIN_SCALE = {1.5f, 1.0f, 1.0f};
 
-    /** Fills z with the per-cell difference from the floor, in units of typical floor variation. */
+    /** Fills z with the per-cell difference from the surface, in units of its typical variation. */
     private void score() {
         float[] scale = new float[3];
         for (int c = 0; c < 3; c++) {
@@ -204,12 +206,16 @@ public final class FloorDetector {
             label[seed] = next;
             int minX = w, minY = h, maxX = -1, maxY = -1, area = 0;
             float peak = 0f, total = 0f;
+            int peakAt = seed;
             while (head < tail) {
                 int i = queue[head++];
                 int x = i % w, yy = i / w;
                 area++;
                 total += z[i];
-                if (z[i] > peak) peak = z[i];
+                if (z[i] > peak) {
+                    peak = z[i];
+                    peakAt = i;
+                }
                 if (x < minX) minX = x;
                 if (x > maxX) maxX = x;
                 if (yy < minY) minY = yy;
@@ -232,11 +238,60 @@ public final class FloorDetector {
             if (area < 3 || area > maxArea || bw > maxW || bh > maxH) continue;
             // Long thin streaks are pattern edges, not objects.
             if (area < 0.2f * bw * bh) continue;
+            if (onLine(peakAt % w, peakAt / w, minX, minY, maxX, maxY, total / area)) continue;
             float score = peak * (float) Math.sqrt(area) + total / area;
             out.add(new Box(minX / (float) w, minY / (float) h,
                     (maxX + 1) / (float) w, (maxY + 1) / (float) h, score));
         }
         Collections.sort(out, (a, b) -> Float.compare(b.score, a.score));
         return out.size() > MAX_BOXES ? new ArrayList<>(out.subList(0, MAX_BOXES)) : out;
+    }
+
+    private static final int[][] AXES = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
+
+    /**
+     * True when the region is just the brightest bit of a line that carries on past it on both
+     * sides: a seam, a stitch, a crack in the concrete or a table edge. Something lying on such a
+     * line still counts if it stands out, on average, far more than the line itself.
+     */
+    private boolean onLine(int px, int py, int minX, int minY, int maxX, int maxY, float strength) {
+        float minLevel = Math.max(2.4f, threshold() * 0.4f);
+        int len = Math.min(20, Math.max(6, 2 * Math.max(maxX - minX + 1, maxY - minY + 1)));
+        for (int[] axis : AXES) {
+            float ahead = rayLevel(px, py, axis[0], axis[1], minX, minY, maxX, maxY, len);
+            float behind = rayLevel(px, py, -axis[0], -axis[1], minX, minY, maxX, maxY, len);
+            // A ray that runs straight off the frame can't be judged; the other side decides alone.
+            if (ahead < 0f && behind < 0f) continue;
+            float level = ahead < 0f ? behind : behind < 0f ? ahead : Math.min(ahead, behind);
+            if (level >= minLevel && level * 2.5f > strength) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Median, along a ray leaving the box, of the strongest cell across a 3-wide band;
+     * -1 when the frame edge comes too soon to tell.
+     */
+    private float rayLevel(float cx, float cy, int dx, int dy, int minX, int minY, int maxX, int maxY, int len) {
+        float[] vals = new float[len];
+        int count = 0;
+        float x = cx, y = cy;
+        while (x >= minX && x <= maxX && y >= minY && y <= maxY) {
+            x += dx;
+            y += dy;
+        }
+        for (int k = 0; k < len; k++, x += dx, y += dy) {
+            float best = -1f;
+            for (int o = -1; o <= 1; o++) {
+                int sx = Math.round(x) - dy * o, sy = Math.round(y) + dx * o;
+                if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+                best = Math.max(best, z[sy * w + sx]);
+            }
+            if (best < 0f) break;
+            vals[count++] = best;
+        }
+        if (count < 3) return -1f;
+        java.util.Arrays.sort(vals, 0, count);
+        return vals[count / 2];
     }
 }
