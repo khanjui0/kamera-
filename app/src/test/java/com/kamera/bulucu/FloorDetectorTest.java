@@ -13,7 +13,7 @@ public class FloorDetectorTest {
     private static final int W = 120, H = 160;
 
     /** A synthetic carpet: fibre noise, a repeating woven pattern and uneven lighting. */
-    private static float[][] carpet(long seed, float baseY, float baseU, float baseV) {
+    static float[][] carpet(long seed, float baseY, float baseU, float baseV) {
         Random r = new Random(seed);
         float[] y = new float[W * H], u = new float[W * H], v = new float[W * H];
         for (int yy = 0; yy < H; yy++) {
@@ -31,7 +31,7 @@ public class FloorDetectorTest {
     }
 
     /** Smooth grey concrete: fine grain, a few faint stains, lighting falling off to one side. */
-    private static float[][] concrete(long seed) {
+    static float[][] concrete(long seed) {
         Random r = new Random(seed);
         float[] y = new float[W * H], u = new float[W * H], v = new float[W * H];
         float sx = 20 + r.nextInt(80), sy = 20 + r.nextInt(120);
@@ -50,7 +50,7 @@ public class FloorDetectorTest {
     }
 
     /** A wooden table top: wavy grain running along its length, with darker lines. */
-    private static float[][] wood(long seed) {
+    static float[][] wood(long seed) {
         Random r = new Random(seed);
         float[] y = new float[W * H], u = new float[W * H], v = new float[W * H];
         double phase = r.nextDouble() * 6;
@@ -68,7 +68,7 @@ public class FloorDetectorTest {
     }
 
     /** A dark car seat: perforated leather or fabric with stitched seams. */
-    private static float[][] carSeat(long seed) {
+    static float[][] carSeat(long seed) {
         Random r = new Random(seed);
         float[] y = new float[W * H], u = new float[W * H], v = new float[W * H];
         for (int yy = 0; yy < H; yy++) {
@@ -200,6 +200,64 @@ public class FloorDetectorTest {
             assertTrue("ring, seed " + seed, covers(boxes, 40, 75));
             assertTrue("coin, seed " + seed, covers(boxes, 60, 100));
         }
+    }
+
+    /**
+     * Like a real photo from a phone held at standing height: a speckled vinyl floor, a white
+     * bottle cap with its shadow, shoes and trousers coming in from the bottom of the picture and
+     * a blue table leg from the side. Only the cap is a lost thing.
+     */
+    static float[][] floorWithFeet(long seed, int capX, int capY) {
+        Random r = new Random(seed);
+        float[] y = new float[W * H], u = new float[W * H], v = new float[W * H];
+        float[][] img = {y, u, v};
+        for (int i = 0; i < W * H; i++) {
+            y[i] = 162f + (float) r.nextGaussian() * 3f;
+            u[i] = 1f + (float) r.nextGaussian();
+            v[i] = 2f + (float) r.nextGaussian();
+        }
+        for (int k = 0; k < 400; k++) y[r.nextInt(W * H)] -= 15f + r.nextFloat() * 20f;
+        // Trousers along the bottom, shoes poking out above them.
+        for (int yy = 125; yy < H; yy++) {
+            for (int x = 0; x < W; x++) if (x < 40 || x > 85) set(img, x, yy, 20f + r.nextFloat() * 6f, 0f, 0f);
+        }
+        for (int yy = 95; yy < 135; yy++) {
+            for (int x = 10; x < 34; x++) set(img, x, yy, (x + yy) % 5 == 0 ? 120f : 70f, -3f, 5f);
+            for (int x = 85; x < 110; x++) set(img, x, yy, (x + yy) % 5 == 0 ? 110f : 80f, -2f, 3f);
+        }
+        // Table leg slanting in from the right edge.
+        for (int yy = 5; yy < 75; yy++) {
+            int x0 = 119 - (75 - yy) / 4;
+            for (int x = x0 - 8; x <= 119; x++) set(img, x, yy, 150f, 18f, -12f);
+        }
+        // The cap: white rim, slightly grey inside, shadow on one side.
+        paint(img, capX + 1, capY + 2, 3, 145f, 1f, 2f);
+        paint(img, capX, capY, 3, 178f, 0f, 1f);
+        paint(img, capX, capY, 1, 168f, 0f, 1f);
+        return img;
+    }
+
+    private static void set(float[][] img, int x, int yy, float y, float u, float v) {
+        if (x < 0 || x >= W || yy < 0 || yy >= H) return;
+        int i = yy * W + x;
+        img[0][i] = y;
+        img[1][i] = u;
+        img[2][i] = v;
+    }
+
+    @Test
+    public void findsTheCapButNotFeetOrFurniture() {
+        FloorDetector d = new FloorDetector(W, H);
+        int found = 0;
+        for (long seed = 1; seed <= 20; seed++) {
+            float[][] img = floorWithFeet(seed, 60, 70);
+            List<FloorDetector.Box> boxes = d.detect(img[0], img[1], img[2]);
+            boolean cap = covers(boxes, 60, 70);
+            if (cap) found++;
+            assertEquals("nothing but the cap, seed " + seed, cap ? 1 : 0, boxes.size());
+        }
+        // The tracker carries a box over a missed frame, so the odd miss doesn't show.
+        assertTrue("cap found in " + found + "/20 frames", found >= 18);
     }
 
     @Test

@@ -5,6 +5,8 @@ set -x
 pkg=com.kamera.bulucu
 adb install -r app/build/outputs/apk/release/app-release.apk
 adb shell pm grant $pkg android.permission.CAMERA
+# Lie the phone flat, screen up, so the back camera faces down and scanning runs.
+adb emu sensor set acceleration 0:0:9.81 || true
 adb logcat -c || true
 adb shell am start -W -n $pkg/.MainActivity
 sleep 15

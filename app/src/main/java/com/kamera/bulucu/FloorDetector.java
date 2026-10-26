@@ -1,18 +1,30 @@
 package com.kamera.bulucu;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
 /**
- * Finds small things that look different from the surface around them: a carpet, a concrete
- * floor, a table top, a car seat.
+ * Finds a small thing lying on a surface - any surface: a carpet, concrete, a table top, a car
+ * seat, tiles, grass - by looking for what doesn't belong to it.
  *
- * Works on a low-resolution Y/U/V grid. Each cell is compared with the average of a large
- * neighbourhood (the surface), the difference is scaled by how much the surface itself normally
- * varies, and connected regions of cells that stand out are reported as boxes. Big regions are
- * dropped because they are patterns, shadows or furniture rather than a lost object, and so are
- * bits of lines (seams, wood grain, cracks) that carry on past the region.
+ * Works on a low-resolution Y/U/V grid:
+ * <ol>
+ * <li>Uneven lighting is taken out by subtracting the surface's local level (a median over a large
+ * neighbourhood, so feet and furniture in the picture don't shift it).</li>
+ * <li>The surface's own colours are learned (one for concrete, two for stripes, several for a
+ * mosaic). Each cell gets an "energy": the mean, over its 3x3 neighbourhood, of the squared
+ * distance to the nearest of those colours, so a bright rim and its dark shadow add up instead of
+ * cancelling. Divided by the frame's median energy, the surface's own texture lands near 1
+ * whatever the surface is.</li>
+ * <li>Connected regions that stand out become candidates. A lost thing is a small island: wholly in
+ * view and surrounded by surface. So regions that are too big, touch the edge of the picture, join
+ * up with something big (a foot, a chair leg), or are just part of a line (a seam, a crack, grout)
+ * are dropped.</li>
+ * <li>Odd one out: a candidate that looks like several others in the same frame is part of the
+ * pattern (polka dots, pebbles, chips in terrazzo), not something dropped on it.</li>
+ * </ol>
  * Plain Java so it can be tested off the device.
  */
 public final class FloorDetector {
@@ -33,14 +45,28 @@ public final class FloorDetector {
 
     public static final int MAX_BOXES = 6;
 
+    /** Energy threshold at sensitivity 0, and how much it drops per sensitivity step. */
+    private static final float THRESHOLD_AT_0 = 3.2f, THRESHOLD_SLOPE = 0.012f;
+    /** Energy that is clearly above the surface's own texture; used to test that a find is an island. */
+    private static final float FAINT = 1.5f;
+    /** Below these, differences are sensor noise (grey levels per channel). */
+    private static final float[] MIN_RAW_SCALE = {2f, 1.2f, 1.2f};
+    /** Largest find, as a share of the picture's width/height and area. */
+    private static final float MAX_SIDE = 0.25f, MAX_AREA = 0.03f;
+    /** A candidate with this many look-alikes in the frame is part of the pattern. */
+    private static final int LOOK_ALIKES = 3;
+    /** More distinct candidates than this and the surface is too busy to trust any one. */
+    private static final int BUSY_CANDIDATES = 10;
+
     private final int w, h, n;
     private final int bgRadius;
 
-    private final float[][] fineCh, bgCh;
-    private final float[] z, weight, tmp;
+    private final float[][] fineCh, bgCh, resid;
+    private final float[] z, weight, tmp, sq;
     private final double[] sumV, sumW;
     private final int[] hist = new int[1024];
-    private final int[] label, queue;
+    private final int[] label, queue, ext;
+    private int extStamp;
 
     /** Higher means more things are reported. 0..100. */
     private volatile int sensitivity = 50;
@@ -54,13 +80,17 @@ public final class FloorDetector {
         this.bgRadius = Math.max(4, Math.min(w, h) / 9);
         fineCh = new float[3][n];
         bgCh = new float[3][n];
+        resid = new float[3][n];
         z = new float[n];
         weight = new float[n];
         tmp = new float[n];
+        sq = new float[n];
         sumV = new double[(w + 1) * (h + 1)];
         sumW = new double[(w + 1) * (h + 1)];
         label = new int[n];
         queue = new int[n];
+        ext = new int[n];
+        colourOf = new int[n];
     }
 
     public int width() {
@@ -79,9 +109,8 @@ public final class FloorDetector {
         return busy;
     }
 
-    /** Threshold on the combined, noise-normalised difference. */
     float threshold() {
-        return 7.5f - 0.04f * sensitivity;
+        return THRESHOLD_AT_0 - THRESHOLD_SLOPE * sensitivity;
     }
 
     /** y, u and v are w*h arrays; u and v centred on 0. */
@@ -89,42 +118,200 @@ public final class FloorDetector {
         float[][] ch = {y, u, v};
         for (int c = 0; c < 3; c++) boxBlur(ch[c], null, 1, fineCh[c]);
 
-        // First pass: plain neighbourhood average.
-        for (int c = 0; c < 3; c++) boxBlur(fineCh[c], null, bgRadius, bgCh[c]);
-        float t = threshold();
-        score();
+        for (int c = 0; c < 3; c++) surfaceLevel(fineCh[c], bgCh[c]);
 
-        // Second pass: leave out what already stands out, so an object doesn't tint its own surface.
-        for (int i = 0; i < n; i++) weight[i] = z[i] > t * 0.5f ? 0f : 1f;
-        for (int c = 0; c < 3; c++) boxBlur(fineCh[c], weight, bgRadius, bgCh[c]);
-        score();
-
-        return components(t);
+        energyScore(ch);
+        return components(threshold());
     }
 
-    private static final float[] MIN_SCALE = {1.5f, 1.0f, 1.0f};
+    private static final int BG_BLOCK = 8, BG_STEP = 2;
+    private float[] blockMed, medBuf;
 
-    /** Fills z with the per-cell difference from the surface, in units of its typical variation. */
-    private void score() {
+    /**
+     * The surface's own level at every cell, with lighting falloff: medians over windows about a
+     * fifth of the picture across, on a coarse grid, blended between. A median ignores anything
+     * covering less than half the window - a foot, trousers, a chair leg - where an average would
+     * be dragged towards it and make the floor beside it look unusual.
+     */
+    private void surfaceLevel(float[] src, float[] dst) {
+        int bx = (w + BG_BLOCK - 1) / BG_BLOCK, by = (h + BG_BLOCK - 1) / BG_BLOCK;
+        if (blockMed == null) {
+            blockMed = new float[bx * by];
+            int side = 2 * bgRadius + 1;
+            medBuf = new float[(side / BG_STEP + 1) * (side / BG_STEP + 1)];
+        }
+        for (int j = 0; j < by; j++) {
+            for (int k = 0; k < bx; k++) {
+                int cx = Math.min(w - 1, k * BG_BLOCK + BG_BLOCK / 2), cy = Math.min(h - 1, j * BG_BLOCK + BG_BLOCK / 2);
+                int x0 = Math.max(0, cx - bgRadius), x1 = Math.min(w - 1, cx + bgRadius);
+                int y0 = Math.max(0, cy - bgRadius), y1 = Math.min(h - 1, cy + bgRadius);
+                int m = 0;
+                for (int y = y0; y <= y1; y += BG_STEP) {
+                    for (int x = x0; x <= x1; x += BG_STEP) medBuf[m++] = src[y * w + x];
+                }
+                Arrays.sort(medBuf, 0, m);
+                blockMed[j * bx + k] = medBuf[m / 2];
+            }
+        }
+        for (int y = 0; y < h; y++) {
+            float fy = Math.max(0f, Math.min(by - 1f, (y - BG_BLOCK / 2f) / BG_BLOCK));
+            int j0 = (int) fy, j1 = Math.min(by - 1, j0 + 1);
+            float ty = fy - j0;
+            for (int x = 0; x < w; x++) {
+                float fx = Math.max(0f, Math.min(bx - 1f, (x - BG_BLOCK / 2f) / BG_BLOCK));
+                int k0 = (int) fx, k1 = Math.min(bx - 1, k0 + 1);
+                float tx = fx - k0;
+                float top = blockMed[j0 * bx + k0] * (1 - tx) + blockMed[j0 * bx + k1] * tx;
+                float bot = blockMed[j1 * bx + k0] * (1 - tx) + blockMed[j1 * bx + k1] * tx;
+                dst[y * w + x] = top * (1 - ty) + bot * ty;
+            }
+        }
+    }
+
+    /**
+     * Fills z with each cell's 3x3 energy relative to the frame's median, and resid with the
+     * scaled differences from the surface average. Energy is measured from the nearest of the
+     * surface's own colours, so a striped or black-and-white floor doesn't make every cell look
+     * unusual and drown out the one thing that really is.
+     */
+    private void energyScore(float[][] ch) {
         float[] scale = new float[3];
         for (int c = 0; c < 3; c++) {
-            float[] f = fineCh[c], b = bgCh[c];
+            float[] f = ch[c], b = bgCh[c];
             for (int i = 0; i < n; i++) tmp[i] = Math.abs(f[i] - b[i]);
-            scale[c] = Math.max(MIN_SCALE[c], 1.4826f * median(tmp));
+            scale[c] = Math.max(MIN_RAW_SCALE[c], 1.4826f * median(tmp));
         }
         for (int i = 0; i < n; i++) {
-            float sum = 0f;
-            for (int c = 0; c < 3; c++) {
-                float d = (fineCh[c][i] - bgCh[c][i]) / scale[c];
-                sum += d * d;
+            for (int c = 0; c < 3; c++) resid[c][i] = (ch[c][i] - bgCh[c][i]) / scale[c];
+        }
+        learnPalette();
+        // Which of those colours each cell is, and how much they vary within themselves - the
+        // yardstick for "different", rather than how different the colours are from each other.
+        for (int i = 0; i < n; i++) {
+            float r0 = resid[0][i], r1 = resid[1][i], r2 = resid[2][i];
+            float best = Float.MAX_VALUE;
+            int bestK = 0;
+            for (int k = 0; k < paletteSize; k++) {
+                float a = r0 - palette[k][0], b = r1 - palette[k][1], c = r2 - palette[k][2];
+                float d = a * a + b * b + c * c;
+                if (d < best) {
+                    best = d;
+                    bestK = k;
+                }
             }
-            z[i] = (float) Math.sqrt(sum);
+            colourOf[i] = bestK;
+        }
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < n; i++) tmp[i] = Math.abs(resid[c][i] - palette[colourOf[i]][c]);
+            within[c] = Math.max(MIN_RAW_SCALE[c] / scale[c], 1.4826f * median(tmp));
+        }
+        // Distance to the nearest of the colours actually found around the cell: the colour of
+        // a shoe at the edge of the picture doesn't make a white cap in the middle look normal.
+        Arrays.fill(sq, Float.MAX_VALUE);
+        for (int k = 0; k < paletteSize; k++) {
+            for (int i = 0; i < n; i++) weight[i] = colourOf[i] == k ? 1f : 0f;
+            boxBlur(weight, null, COLOUR_RADIUS, tmp);
+            float p0 = palette[k][0], p1 = palette[k][1], p2 = palette[k][2];
+            for (int i = 0; i < n; i++) {
+                if (tmp[i] < COLOUR_SHARE) continue;
+                float a = (resid[0][i] - p0) / within[0], b = (resid[1][i] - p1) / within[1], c = (resid[2][i] - p2) / within[2];
+                float d = a * a + b * b + c * c;
+                if (d < sq[i]) sq[i] = d;
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            // No common colour around at all (inside something big): use the cell's own nearest.
+            if (sq[i] != Float.MAX_VALUE) continue;
+            float[] pc = palette[colourOf[i]];
+            float a = (resid[0][i] - pc[0]) / within[0], b = (resid[1][i] - pc[1]) / within[1], c = (resid[2][i] - pc[2]) / within[2];
+            sq[i] = a * a + b * b + c * c;
+        }
+        boxBlur(sq, null, 1, tmp);
+        for (int i = 0; i < n; i++) tmp[i] = (float) Math.sqrt(tmp[i]);
+        float m = Math.max(0.5f, median(tmp));
+        for (int i = 0; i < n; i++) z[i] = tmp[i] / m;
+    }
+
+    private static final int PALETTE_MAX = 8, PALETTE_STRIDE = 2, PALETTE_ITER = 6;
+    /** A colour must cover this share of the picture to count as the surface's own. */
+    private static final float PALETTE_SUPPORT = 0.025f;
+    private final float[][] palette = new float[PALETTE_MAX][3];
+    private final float[][] palSum = new float[PALETTE_MAX][3];
+    private final int[] palCount = new int[PALETTE_MAX];
+    private int paletteSize;
+    private final int[] colourOf;
+    /** How much each channel varies within one of the surface's colours (in resid units). */
+    private final float[] within = new float[3];
+    /** A colour counts as found around a cell if it covers this share of the window around it. */
+    private static final int COLOUR_RADIUS = 20;
+    private static final float COLOUR_SHARE = 0.03f;
+
+    /**
+     * The surface's main colours (as differences from its average): k-means over a sample of
+     * cells, keeping only colours common enough that they can't be a dropped thing.
+     */
+    private void learnPalette() {
+        // Spread the starting colours over the range of brightness, where patterns differ most.
+        float lo = Float.MAX_VALUE, hi = -Float.MAX_VALUE;
+        for (int i = 0; i < n; i += PALETTE_STRIDE) {
+            lo = Math.min(lo, resid[0][i]);
+            hi = Math.max(hi, resid[0][i]);
+        }
+        int k = PALETTE_MAX;
+        for (int j = 0; j < k; j++) {
+            palette[j][0] = lo + (hi - lo) * (j + 0.5f) / k;
+            palette[j][1] = (j % 3 - 1) * 1.5f;
+            palette[j][2] = ((j / 3) % 3 - 1) * 1.5f;
+        }
+        int samples = 0;
+        for (int it = 0; it < PALETTE_ITER; it++) {
+            for (int j = 0; j < k; j++) {
+                palCount[j] = 0;
+                palSum[j][0] = palSum[j][1] = palSum[j][2] = 0f;
+            }
+            samples = 0;
+            for (int y = 0; y < h; y += PALETTE_STRIDE) {
+                for (int x = (y / PALETTE_STRIDE) % 2; x < w; x += PALETTE_STRIDE) {
+                    int i = y * w + x;
+                    float r0 = resid[0][i], r1 = resid[1][i], r2 = resid[2][i];
+                    int bestJ = 0;
+                    float best = Float.MAX_VALUE;
+                    for (int j = 0; j < k; j++) {
+                        float a = r0 - palette[j][0], b = r1 - palette[j][1], c = r2 - palette[j][2];
+                        float d = a * a + b * b + c * c;
+                        if (d < best) {
+                            best = d;
+                            bestJ = j;
+                        }
+                    }
+                    palCount[bestJ]++;
+                    palSum[bestJ][0] += r0;
+                    palSum[bestJ][1] += r1;
+                    palSum[bestJ][2] += r2;
+                    samples++;
+                }
+            }
+            for (int j = 0; j < k; j++) {
+                if (palCount[j] == 0) continue;
+                for (int c = 0; c < 3; c++) palette[j][c] = palSum[j][c] / palCount[j];
+            }
+        }
+        int minCount = Math.max(1, Math.round(samples * PALETTE_SUPPORT));
+        paletteSize = 0;
+        for (int j = 0; j < k; j++) {
+            if (palCount[j] < minCount) continue;
+            System.arraycopy(palette[j], 0, palette[paletteSize], 0, 3);
+            paletteSize++;
+        }
+        if (paletteSize == 0) {
+            palette[0][0] = palette[0][1] = palette[0][2] = 0f;
+            paletteSize = 1;
         }
     }
 
     /** Median of non-negative values, to 1/16 precision, without sorting. */
     private float median(float[] a) {
-        java.util.Arrays.fill(hist, 0);
+        Arrays.fill(hist, 0);
         int top = hist.length - 1;
         for (int i = 0; i < n; i++) {
             int b = (int) (a[i] * 16f);
@@ -185,33 +372,39 @@ public final class FloorDetector {
         return (float) (s / cnt);
     }
 
-    /** Groups standing-out cells (hysteresis + 8-connectivity) and keeps the small, solid ones. */
-    private List<Box> components(float t) {
-        float low = t * 0.6f;
-        java.util.Arrays.fill(label, 0);
-        int strong = 0;
-        for (int i = 0; i < n; i++) if (z[i] > t) strong++;
-        busy = strong > n * 0.12f;
-        List<Box> out = new ArrayList<>();
-        if (busy) return out;
+    /** A spot, with what it looks like for the odd-one-out test; box is set if it is a find. */
+    private static final class Candidate {
+        Box box;
+        float dy, du, dv, area;
+    }
 
-        int maxW = Math.round(w * 0.35f), maxH = Math.round(h * 0.35f);
-        int maxArea = Math.round(n * 0.05f);
+    /** Groups standing-out cells (hysteresis + 8-connectivity) and keeps the small islands. */
+    private List<Box> components(float t) {
+        float low = Math.max(FAINT, t * 0.6f);
+        Arrays.fill(label, 0);
+        int maxW = Math.round(w * MAX_SIDE), maxH = Math.round(h * MAX_SIDE);
+        int maxArea = Math.round(n * MAX_AREA);
+        List<Candidate> found = new ArrayList<>();
         int next = 0;
+        // Weaker spots are collected too, only to count as look-alikes: a speckled floor has many
+        // faint specks like the one dark speck that happens to pass the threshold.
         for (int seed = 0; seed < n; seed++) {
-            if (label[seed] != 0 || z[seed] <= t) continue;
+            if (label[seed] != 0 || z[seed] <= low) continue;
             next++;
             int head = 0, tail = 0;
             queue[tail++] = seed;
             label[seed] = next;
             int minX = w, minY = h, maxX = -1, maxY = -1, area = 0;
-            float peak = 0f, total = 0f;
+            float peak = 0f, total = 0f, sy = 0f, su = 0f, sv = 0f;
             int peakAt = seed;
             while (head < tail) {
                 int i = queue[head++];
                 int x = i % w, yy = i / w;
                 area++;
                 total += z[i];
+                sy += resid[0][i];
+                su += resid[1][i];
+                sv += resid[2][i];
                 if (z[i] > peak) {
                     peak = z[i];
                     peakAt = i;
@@ -236,18 +429,91 @@ public final class FloorDetector {
             }
             int bw = maxX - minX + 1, bh = maxY - minY + 1;
             if (area < 3 || area > maxArea || bw > maxW || bh > maxH) continue;
+            Candidate c = new Candidate();
+            c.dy = sy / area / within[0];
+            c.du = su / area / within[1];
+            c.dv = sv / area / within[2];
+            c.area = area;
+            found.add(c);
+            if (peak <= t) continue;
+            // Feet, furniture legs and anything else coming in from the edge of the picture.
+            if (minX == 0 || minY == 0 || maxX == w - 1 || maxY == h - 1) continue;
             // Long thin streaks are pattern edges, not objects.
             if (area < 0.2f * bw * bh) continue;
+            if (!isolated(next, minX, minY, maxX, maxY, maxW, maxH, maxArea)) continue;
             if (onLine(peakAt % w, peakAt / w, minX, minY, maxX, maxY, total / area)) continue;
-            float score = peak * (float) Math.sqrt(area) + total / area;
-            out.add(new Box(minX / (float) w, minY / (float) h,
-                    (maxX + 1) / (float) w, (maxY + 1) / (float) h, score));
+            c.box = new Box(minX / (float) w, minY / (float) h, (maxX + 1) / (float) w, (maxY + 1) / (float) h,
+                    peak * (float) Math.sqrt(area) + total / area);
         }
+
+        List<Box> out = new ArrayList<>();
+        for (Candidate c : found) {
+            if (c.box == null) continue;
+            int alike = 0;
+            for (Candidate o : found) if (o != c && alike(c, o)) alike++;
+            if (alike < LOOK_ALIKES) out.add(c.box);
+        }
+        busy = out.size() > BUSY_CANDIDATES;
+        if (busy) return new ArrayList<>();
         Collections.sort(out, (a, b) -> Float.compare(b.score, a.score));
         return out.size() > MAX_BOXES ? new ArrayList<>(out.subList(0, MAX_BOXES)) : out;
     }
 
+    /** Same colour and brightness against the surface, and about the same size. */
+    private static boolean alike(Candidate a, Candidate b) {
+        float ratio = a.area > b.area ? a.area / b.area : b.area / a.area;
+        if (ratio > 3f) return false;
+        float ey = a.dy - b.dy, eu = a.du - b.du, ev = a.dv - b.dv;
+        float dist = (float) Math.sqrt(ey * ey + eu * eu + ev * ev);
+        float na = (float) Math.sqrt(a.dy * a.dy + a.du * a.du + a.dv * a.dv);
+        float nb = (float) Math.sqrt(b.dy * b.dy + b.du * b.du + b.dv * b.dv);
+        float lo = Math.min(na, nb), hi = Math.max(na, nb);
+        if (hi > 2f * lo + 1f) return false;
+        return dist < 0.4f * lo + 0.8f;
+    }
+
+    /**
+     * Grows the region through anything clearly unlike the surface; it stays an island only if
+     * that wider region is still small and doesn't reach the edge of the picture.
+     */
+    private boolean isolated(int id, int minX, int minY, int maxX, int maxY, int maxW, int maxH, int maxArea) {
+        extStamp++;
+        int head = 0, tail = 0;
+        for (int y = minY; y <= maxY; y++) {
+            for (int x = minX; x <= maxX; x++) {
+                int i = y * w + x;
+                if (label[i] == id) {
+                    ext[i] = extStamp;
+                    queue[tail++] = i;
+                }
+            }
+        }
+        int x0 = minX, x1 = maxX, y0 = minY, y1 = maxY;
+        int limit = maxArea * 2;
+        while (head < tail) {
+            int i = queue[head++];
+            int x = i % w, y = i / w;
+            if (x == 0 || y == 0 || x == w - 1 || y == h - 1) return false;
+            if (x < x0) x0 = x;
+            if (x > x1) x1 = x;
+            if (y < y0) y0 = y;
+            if (y > y1) y1 = y;
+            if (tail > limit || x1 - x0 >= maxW || y1 - y0 >= maxH) return false;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    int j = i + dy * w + dx;
+                    if (ext[j] != extStamp && z[j] > FAINT) {
+                        ext[j] = extStamp;
+                        queue[tail++] = j;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     private static final int[][] AXES = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
+    private static final float LINE_MIN = 1.6f;
 
     /**
      * True when the region is just the brightest bit of a line that carries on past it on both
@@ -255,7 +521,7 @@ public final class FloorDetector {
      * line still counts if it stands out, on average, far more than the line itself.
      */
     private boolean onLine(int px, int py, int minX, int minY, int maxX, int maxY, float strength) {
-        float minLevel = Math.max(2.4f, threshold() * 0.4f);
+        float minLevel = Math.max(LINE_MIN, threshold() * 0.5f);
         int len = Math.min(20, Math.max(6, 2 * Math.max(maxX - minX + 1, maxY - minY + 1)));
         for (int[] axis : AXES) {
             float ahead = rayLevel(px, py, axis[0], axis[1], minX, minY, maxX, maxY, len);
@@ -291,7 +557,7 @@ public final class FloorDetector {
             vals[count++] = best;
         }
         if (count < 3) return -1f;
-        java.util.Arrays.sort(vals, 0, count);
+        Arrays.sort(vals, 0, count);
         return vals[count / 2];
     }
 }

@@ -7,6 +7,10 @@ import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.ImageFormat;
 import android.graphics.SurfaceTexture;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
@@ -44,12 +48,17 @@ import java.util.List;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
-public class MainActivity extends Activity {
+public class MainActivity extends Activity implements SensorEventListener {
 
     private static final String TAG = "KayipBulucu";
     private static final int REQ_CAMERA = 1;
     /** Long side of the analysis grid; a cell is roughly 1/160 of the frame. */
     private static final int GRID_LONG_SIDE = 160;
+    /**
+     * How directly the back camera must face down (cosine of the angle from straight down) for
+     * scanning: lost things are on the floor, a table or a seat, not on walls and ceilings.
+     */
+    private static final float FACING_DOWN = 0.5f;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Semaphore openCloseLock = new Semaphore(1);
@@ -73,6 +82,9 @@ public class MainActivity extends Activity {
     private volatile boolean torchOn;
     private volatile int sensitivity = 50;
     private boolean askedPermission;
+    private SensorManager sensors;
+    /** Assume facing down until a sensor says otherwise, so phones without one still work. */
+    private volatile boolean facingDown = true;
 
     private Size previewSize;
     private Size analysisSize;
@@ -86,6 +98,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        sensors = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
         buildUi();
     }
 
@@ -158,7 +171,7 @@ public class MainActivity extends Activity {
         hint.setTextColor(0xFF9E9E9E);
         hint.setTextSize(13);
         hint.setGravity(Gravity.CENTER);
-        hint.setText("Kamerayı aradığın yüzeye (yer, halı, masa, koltuk…) 20–60 cm uzaktan tutup yavaşça gezdir. Yeşil kutu, yüzeyden farklı görünen küçük şeyi gösterir.");
+        hint.setText("Telefonu aradığın yere (yer, halı, masa, koltuk…) doğru tutup yavaşça gezdir. Yeşil kutu, yüzeyden farklı görünen küçük şeyi gösterir; ayakkabı ya da mobilya gibi büyük şeyleri göstermez.");
         panel.addView(hint);
 
         root.addView(panel);
@@ -173,6 +186,11 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (sensors != null) {
+            Sensor gravity = sensors.getDefaultSensor(Sensor.TYPE_GRAVITY);
+            if (gravity == null) gravity = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+            if (gravity != null) sensors.registerListener(this, gravity, SensorManager.SENSOR_DELAY_UI);
+        }
         startBackground();
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             // Ask once by itself; after a refusal the button asks again, so a denial can't loop.
@@ -187,6 +205,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        if (sensors != null) sensors.unregisterListener(this);
         closeCamera();
         stopBackground();
         super.onPause();
@@ -455,6 +474,18 @@ public class MainActivity extends Activity {
         overlay.setBoxes(new ArrayList<>());
     }
 
+    @Override
+    public void onSensorChanged(SensorEvent e) {
+        float x = e.values[0], y = e.values[1], z = e.values[2];
+        float g = (float) Math.sqrt(x * x + y * y + z * z);
+        // Screen up means the back camera looks down; gravity then lies along the screen's normal.
+        if (g > 1f) facingDown = z / g > FACING_DOWN;
+    }
+
+    @Override
+    public void onAccuracyChanged(Sensor sensor, int accuracy) {
+    }
+
     /** Runs on the camera thread for every analysis frame. */
     private void onFrame(ImageReader r) {
         Image image;
@@ -464,6 +495,15 @@ public class MainActivity extends Activity {
             return;
         }
         if (image == null) return;
+        if (!facingDown) {
+            image.close();
+            tracker.reset();
+            main.post(() -> {
+                overlay.setBoxes(new ArrayList<>());
+                setStatus("Kamerayı aşağı, aradığın yere (yer, masa, koltuk…) doğrult.");
+            });
+            return;
+        }
         try {
             toGrid(image);
         } catch (RuntimeException e) {
@@ -481,7 +521,7 @@ public class MainActivity extends Activity {
         main.post(() -> {
             overlay.setBoxes(boxes);
             if (busy && boxes.isEmpty()) {
-                setStatus("Yüzey çok karışık görünüyor — biraz yaklaş ya da hassasiyeti düşür.");
+                setStatus("Yüzey çok desenli — biraz yaklaş ya da hassasiyeti düşür.");
             } else if (boxes.isEmpty()) {
                 setStatus("Taranıyor… kamerayı yüzeyde yavaşça gezdir.");
             } else {
