@@ -78,6 +78,7 @@ public final class FloorDetector {
         this.h = h;
         this.n = w * h;
         this.bgRadius = Math.max(4, Math.min(w, h) / 9);
+        this.colourRadius = Math.max(8, Math.min(w, h) / 6);
         fineCh = new float[3][n];
         bgCh = new float[3][n];
         resid = new float[3][n];
@@ -124,7 +125,9 @@ public final class FloorDetector {
         return components(threshold());
     }
 
-    private static final int BG_BLOCK = 8, BG_STEP = 2;
+    private static final int BG_BLOCK = 8;
+    /** Samples per side of each median window; enough for a stable median at any grid size. */
+    private static final int BG_SAMPLES = 13;
     private float[] blockMed, medBuf;
 
     /**
@@ -135,10 +138,11 @@ public final class FloorDetector {
      */
     private void surfaceLevel(float[] src, float[] dst) {
         int bx = (w + BG_BLOCK - 1) / BG_BLOCK, by = (h + BG_BLOCK - 1) / BG_BLOCK;
+        int step = Math.max(1, (2 * bgRadius + 1) / BG_SAMPLES);
         if (blockMed == null) {
             blockMed = new float[bx * by];
-            int side = 2 * bgRadius + 1;
-            medBuf = new float[(side / BG_STEP + 1) * (side / BG_STEP + 1)];
+            int perSide = (2 * bgRadius) / step + 1;
+            medBuf = new float[perSide * perSide];
         }
         for (int j = 0; j < by; j++) {
             for (int k = 0; k < bx; k++) {
@@ -146,11 +150,10 @@ public final class FloorDetector {
                 int x0 = Math.max(0, cx - bgRadius), x1 = Math.min(w - 1, cx + bgRadius);
                 int y0 = Math.max(0, cy - bgRadius), y1 = Math.min(h - 1, cy + bgRadius);
                 int m = 0;
-                for (int y = y0; y <= y1; y += BG_STEP) {
-                    for (int x = x0; x <= x1; x += BG_STEP) medBuf[m++] = src[y * w + x];
+                for (int y = y0; y <= y1; y += step) {
+                    for (int x = x0; x <= x1; x += step) medBuf[m++] = src[y * w + x];
                 }
-                Arrays.sort(medBuf, 0, m);
-                blockMed[j * bx + k] = medBuf[m / 2];
+                blockMed[j * bx + k] = select(medBuf, m, m / 2);
             }
         }
         for (int y = 0; y < h; y++) {
@@ -210,7 +213,7 @@ public final class FloorDetector {
         Arrays.fill(sq, Float.MAX_VALUE);
         for (int k = 0; k < paletteSize; k++) {
             for (int i = 0; i < n; i++) weight[i] = colourOf[i] == k ? 1f : 0f;
-            boxBlur(weight, null, COLOUR_RADIUS, tmp);
+            boxBlur(weight, null, colourRadius, tmp);
             float p0 = palette[k][0], p1 = palette[k][1], p2 = palette[k][2];
             for (int i = 0; i < n; i++) {
                 if (tmp[i] < COLOUR_SHARE) continue;
@@ -232,6 +235,30 @@ public final class FloorDetector {
         for (int i = 0; i < n; i++) z[i] = tmp[i] / m;
     }
 
+    /** The k-th smallest of a[0..n), reordering a (Hoare's quickselect). */
+    private static float select(float[] a, int n, int k) {
+        int lo = 0, hi = n - 1;
+        while (lo < hi) {
+            float pivot = a[(lo + hi) >>> 1];
+            int i = lo, j = hi;
+            while (i <= j) {
+                while (a[i] < pivot) i++;
+                while (a[j] > pivot) j--;
+                if (i <= j) {
+                    float t = a[i];
+                    a[i] = a[j];
+                    a[j] = t;
+                    i++;
+                    j--;
+                }
+            }
+            if (k <= j) hi = j;
+            else if (k >= i) lo = i;
+            else break;
+        }
+        return a[k];
+    }
+
     private static final int PALETTE_MAX = 8, PALETTE_STRIDE = 2, PALETTE_ITER = 6;
     /** A colour must cover this share of the picture to count as the surface's own. */
     private static final float PALETTE_SUPPORT = 0.025f;
@@ -243,8 +270,8 @@ public final class FloorDetector {
     /** How much each channel varies within one of the surface's colours (in resid units). */
     private final float[] within = new float[3];
     /** A colour counts as found around a cell if it covers this share of the window around it. */
-    private static final int COLOUR_RADIUS = 20;
     private static final float COLOUR_SHARE = 0.03f;
+    private final int colourRadius;
 
     /**
      * The surface's main colours (as differences from its average): k-means over a sample of

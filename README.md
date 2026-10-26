@@ -10,8 +10,14 @@ Nereye düşerse düşsün (yer, halı, masa, araba koltuğu, fayans, çim, kum�
   - Halı deseni, ahşap damarı, dikişler, derzler, çatlaklar, gölgeler.
   - Desende çok sayıda tekrar eden şeyler (puantiye, çakıl taşları, terrazzo parçaları). Sadece "tek olan" gösterilir.
 - Kamera aşağıya bakmıyorsa (duvar, tavan) tarama yapmaz.
+- **Yakınlık 1×/2×/3×**: ayakta dururken uzaktan arıyorsan büyüt; küçük şeyler daha net görünür (destekleyen telefonlarda yakın çekim merceğine geçer).
+- **Dondur / Devam**: görüntüyü ve kutuları dondurur.
+- **Kutuya dokun**: bulunan yeri büyütülmüş gösterir, ne olduğunu hemen anlarsın.
+- **Ses**: yeni bir şey bulununca bip sesi (titreşim her zaman var); açılıp kapatılabilir.
 - **Hassasiyet** çubuğu: çok desenli yüzeyde düşür, düz yüzeyde çok küçük şeyler için artır.
-- **Fener**: loş ortamda (araba içi, koltuk altı) ya da halı tüyleri arasındaki şeyleri belirginleştirmek için.
+- **Fener**: loş ortamda (araba içi, koltuk altı) ya da halı tüyleri arasındaki şeyleri belirginleştirmek için. Ortam karanlıksa uygulama kendisi önerir.
+- Telefonu hızlı gezdirince görüntü bulanıklaşır; uygulama o sırada taramayı bekletir ve "daha yavaş" der.
+- Hassasiyet, ses ve yakınlık ayarları hatırlanır.
 
 Sınırlar: Yüzeyle aynı renkte olan bir şey (siyah lastik üzerinde siyah toka, karda beyaz hap) ve çok yoğun, çok renkli desenler (kilim) zor; bunlarda yaklaşmak ve feneri açmak yardımcı olur.
 

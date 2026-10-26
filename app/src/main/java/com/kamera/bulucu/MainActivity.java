@@ -2,10 +2,17 @@ package com.kamera.bulucu;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.Dialog;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ImageFormat;
+import android.graphics.Paint;
+import android.graphics.Rect;
+import android.graphics.RectF;
 import android.graphics.SurfaceTexture;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
@@ -18,8 +25,10 @@ import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.AudioManager;
 import android.media.Image;
 import android.media.ImageReader;
+import android.media.ToneGenerator;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -28,8 +37,10 @@ import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.util.Log;
+import android.util.Range;
 import android.util.Size;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
@@ -37,6 +48,7 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
@@ -52,13 +64,18 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     private static final String TAG = "KayipBulucu";
     private static final int REQ_CAMERA = 1;
-    /** Long side of the analysis grid; a cell is roughly 1/160 of the frame. */
-    private static final int GRID_LONG_SIDE = 160;
+    /** Long side of the analysis grid; a 640x480 frame is averaged in 3x3 blocks to 213x160. */
+    private static final int GRID_LONG_SIDE = 220;
     /**
      * How directly the back camera must face down (cosine of the angle from straight down) for
      * scanning: lost things are on the floor, a table or a seat, not on walls and ceilings.
      */
     private static final float FACING_DOWN = 0.5f;
+    /** Turning faster than this (rad/s) blurs the picture; analysis waits until it steadies. */
+    private static final float TOO_FAST = 1.6f;
+    /** Average brightness (0..255) below which the torch is suggested. */
+    private static final float DARK = 50f;
+    private static final float[] ZOOMS = {1f, 2f, 3f};
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Semaphore openCloseLock = new Semaphore(1);
@@ -70,7 +87,16 @@ public class MainActivity extends Activity implements SensorEventListener {
     private TextView statusText;
     private TextView sensitivityLabel;
     private Button torchBtn;
+    private Button zoomBtn;
+    private Button freezeBtn;
+    private Button soundBtn;
     private Button retryBtn;
+    private ImageView frozenView;
+    private Bitmap frozenFrame;
+    private volatile boolean frozen;
+    private boolean soundOn = true;
+    private ToneGenerator tone;
+    private SharedPreferences prefs;
 
     private HandlerThread bgThread;
     private Handler bg;
@@ -85,6 +111,11 @@ public class MainActivity extends Activity implements SensorEventListener {
     private SensorManager sensors;
     /** Assume facing down until a sensor says otherwise, so phones without one still work. */
     private volatile boolean facingDown = true;
+    private volatile float turnRate;
+    private Rect activeArray;
+    private float maxZoom = 1f;
+    private boolean zoomRatioSupported;
+    private int zoomIndex;
 
     private Size previewSize;
     private Size analysisSize;
@@ -99,6 +130,10 @@ public class MainActivity extends Activity implements SensorEventListener {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         sensors = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+        prefs = getPreferences(MODE_PRIVATE);
+        sensitivity = prefs.getInt("sensitivity", 50);
+        soundOn = prefs.getBoolean("sound", true);
+        zoomIndex = prefs.getInt("zoom", 0);
         buildUi();
     }
 
@@ -111,8 +146,18 @@ public class MainActivity extends Activity implements SensorEventListener {
 
         previewFrame = new AspectFrame(this);
         textureView = new TextureView(this);
+        frozenView = new ImageView(this);
+        frozenView.setScaleType(ImageView.ScaleType.FIT_XY);
+        frozenView.setVisibility(View.GONE);
         overlay = new OverlayView(this);
+        overlay.setOnTouchListener((v, e) -> {
+            if (e.getAction() != MotionEvent.ACTION_UP) return true;
+            float[] box = overlay.boxAt(e.getX(), e.getY());
+            if (box != null) magnify(box);
+            return true;
+        });
         previewFrame.addView(textureView);
+        previewFrame.addView(frozenView);
         previewFrame.addView(overlay);
         root.addView(previewFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
@@ -140,6 +185,7 @@ public class MainActivity extends Activity implements SensorEventListener {
             public void onProgressChanged(SeekBar s, int value, boolean fromUser) {
                 sensitivity = value;
                 updateSensitivityLabel();
+                prefs.edit().putInt("sensitivity", value).apply();
             }
 
             @Override
@@ -155,27 +201,54 @@ public class MainActivity extends Activity implements SensorEventListener {
 
         LinearLayout buttons = new LinearLayout(this);
         buttons.setGravity(Gravity.CENTER);
-        torchBtn = new Button(this);
-        torchBtn.setText("Feneri Aç");
+        torchBtn = smallButton("Fener");
         torchBtn.setEnabled(false);
         torchBtn.setOnClickListener(v -> setTorch(!torchOn));
-        buttons.addView(torchBtn);
+        buttons.addView(torchBtn, weighted());
+        zoomBtn = smallButton("Yakınlık 1×");
+        zoomBtn.setOnClickListener(v -> cycleZoom());
+        buttons.addView(zoomBtn, weighted());
+        freezeBtn = smallButton("Dondur");
+        freezeBtn.setOnClickListener(v -> setFrozen(!frozen));
+        buttons.addView(freezeBtn, weighted());
+        soundBtn = smallButton(soundOn ? "Ses açık" : "Ses kapalı");
+        soundBtn.setOnClickListener(v -> {
+            soundOn = !soundOn;
+            soundBtn.setText(soundOn ? "Ses açık" : "Ses kapalı");
+            prefs.edit().putBoolean("sound", soundOn).apply();
+        });
+        buttons.addView(soundBtn, weighted());
+        panel.addView(buttons);
         retryBtn = new Button(this);
         retryBtn.setText("Kamera İzni Ver");
         retryBtn.setVisibility(View.GONE);
         retryBtn.setOnClickListener(v -> requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_CAMERA));
-        buttons.addView(retryBtn);
-        panel.addView(buttons);
+        panel.addView(retryBtn);
 
         TextView hint = new TextView(this);
         hint.setTextColor(0xFF9E9E9E);
         hint.setTextSize(13);
         hint.setGravity(Gravity.CENTER);
-        hint.setText("Telefonu aradığın yere (yer, halı, masa, koltuk…) doğru tutup yavaşça gezdir. Yeşil kutu, yüzeyden farklı görünen küçük şeyi gösterir; ayakkabı ya da mobilya gibi büyük şeyleri göstermez.");
+        hint.setText("Telefonu aradığın yere (yer, halı, masa, koltuk…) doğru tutup yavaşça gezdir. Yeşil kutu, yüzeyden farklı görünen küçük şeyi gösterir. Kutuya dokunursan yakından gösterir. Uzaktan arıyorsan yakınlığı artır.");
         panel.addView(hint);
 
         root.addView(panel);
         setContentView(root);
+    }
+
+    private Button smallButton(String text) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setTextSize(12);
+        b.setAllCaps(false);
+        b.setPadding(dp(4), 0, dp(4), 0);
+        return b;
+    }
+
+    private LinearLayout.LayoutParams weighted() {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        lp.setMargins(dp(2), 0, dp(2), 0);
+        return lp;
     }
 
     private void updateSensitivityLabel() {
@@ -190,6 +263,13 @@ public class MainActivity extends Activity implements SensorEventListener {
             Sensor gravity = sensors.getDefaultSensor(Sensor.TYPE_GRAVITY);
             if (gravity == null) gravity = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
             if (gravity != null) sensors.registerListener(this, gravity, SensorManager.SENSOR_DELAY_UI);
+            Sensor gyro = sensors.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+            if (gyro != null) sensors.registerListener(this, gyro, SensorManager.SENSOR_DELAY_UI);
+        }
+        try {
+            tone = new ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80);
+        } catch (RuntimeException e) {
+            tone = null;
         }
         startBackground();
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -206,6 +286,11 @@ public class MainActivity extends Activity implements SensorEventListener {
     @Override
     protected void onPause() {
         if (sensors != null) sensors.unregisterListener(this);
+        if (tone != null) {
+            tone.release();
+            tone = null;
+        }
+        setFrozen(false);
         closeCamera();
         stopBackground();
         super.onPause();
@@ -286,6 +371,7 @@ public class MainActivity extends Activity implements SensorEventListener {
             torchAvailable = flash != null && flash;
             torchBtn.setEnabled(torchAvailable);
             if (!torchAvailable) torchBtn.setText("Fener yok");
+            readZoom(cc);
 
             boolean sideways = sensorRotation % 180 != 0;
             int pw = previewSize.getWidth(), ph = previewSize.getHeight();
@@ -403,6 +489,7 @@ public class MainActivity extends Activity implements SensorEventListener {
             }
             request.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
             applyTorch();
+            applyZoom();
             camera.createCaptureSession(Arrays.asList(previewSurface, reader.getSurface()), new CameraCaptureSession.StateCallback() {
                 @Override
                 public void onConfigured(CameraCaptureSession s) {
@@ -443,11 +530,114 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     private void setTorch(boolean on) {
         torchOn = on;
-        torchBtn.setText(on ? "Feneri Kapat" : "Feneri Aç");
+        torchBtn.setText(on ? "Fener açık" : "Fener");
         if (bg != null) bg.post(() -> {
             applyTorch();
             repeat();
         });
+    }
+
+    /** What zoom this camera offers: a zoom ratio on Android 11+ (which can switch to a tele lens), else cropping. */
+    private void readZoom(CameraCharacteristics cc) {
+        activeArray = cc.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+        maxZoom = 1f;
+        zoomRatioSupported = false;
+        if (Build.VERSION.SDK_INT >= 30) {
+            Range<Float> range = cc.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE);
+            if (range != null) {
+                maxZoom = range.getUpper();
+                zoomRatioSupported = true;
+            }
+        }
+        if (!zoomRatioSupported) {
+            Float digital = cc.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+            if (digital != null && activeArray != null) maxZoom = digital;
+        }
+        if (zoomIndex >= ZOOMS.length || ZOOMS[zoomIndex] > maxZoom) zoomIndex = 0;
+        zoomBtn.setEnabled(maxZoom >= 1.5f);
+        updateZoomLabel();
+    }
+
+    private void updateZoomLabel() {
+        zoomBtn.setText("Yakınlık " + (int) ZOOMS[zoomIndex] + "×");
+    }
+
+    private void cycleZoom() {
+        do {
+            zoomIndex = (zoomIndex + 1) % ZOOMS.length;
+        } while (ZOOMS[zoomIndex] > maxZoom && zoomIndex != 0);
+        updateZoomLabel();
+        prefs.edit().putInt("zoom", zoomIndex).apply();
+        if (bg != null) bg.post(() -> {
+            applyZoom();
+            repeat();
+            tracker.reset();
+        });
+    }
+
+    /** The same zoom reaches the preview and the analysis frames, so boxes still line up. */
+    private void applyZoom() {
+        if (request == null) return;
+        float zoom = ZOOMS[zoomIndex];
+        if (zoomRatioSupported && Build.VERSION.SDK_INT >= 30) {
+            request.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom);
+        } else if (activeArray != null) {
+            int cw = Math.round(activeArray.width() / zoom), ch = Math.round(activeArray.height() / zoom);
+            int left = activeArray.left + (activeArray.width() - cw) / 2, top = activeArray.top + (activeArray.height() - ch) / 2;
+            request.set(CaptureRequest.SCALER_CROP_REGION, new Rect(left, top, left + cw, top + ch));
+        }
+    }
+
+    /** Holds the current picture and boxes still, to look at them calmly; boxes can still be tapped. */
+    private void setFrozen(boolean on) {
+        if (on == frozen) return;
+        if (on) {
+            frozenFrame = textureView.getBitmap();
+            if (frozenFrame == null) return;
+            frozenView.setImageBitmap(frozenFrame);
+            frozenView.setVisibility(View.VISIBLE);
+            frozen = true;
+            freezeBtn.setText("Devam");
+            setStatus(overlay.boxes().isEmpty() ? "Donduruldu." : "Donduruldu — kutuya dokunup yakından bak.");
+        } else {
+            frozen = false;
+            frozenView.setVisibility(View.GONE);
+            frozenView.setImageBitmap(null);
+            frozenFrame = null;
+            freezeBtn.setText("Dondur");
+            // The tracker belongs to the camera thread.
+            if (bg != null) bg.post(tracker::reset);
+            overlay.setBoxes(new ArrayList<>());
+        }
+    }
+
+    /** Shows the area around a box enlarged, with the box marked, so it's clear what was found. */
+    private void magnify(float[] box) {
+        Bitmap src = frozenFrame != null ? frozenFrame : textureView.getBitmap();
+        if (src == null) return;
+        int bw = src.getWidth(), bh = src.getHeight();
+        RectF r = new RectF();
+        overlay.screenRect(box, r);
+        float side = Math.max(Math.max(r.width(), r.height()) * 2.5f, bw * 0.3f);
+        int size = Math.round(Math.min(side, Math.min(bw, bh)));
+        int left = Math.max(0, Math.min(bw - size, Math.round(r.centerX() - size / 2f)));
+        int top = Math.max(0, Math.min(bh - size, Math.round(r.centerY() - size / 2f)));
+        Bitmap crop = Bitmap.createBitmap(src, left, top, size, size).copy(Bitmap.Config.ARGB_8888, true);
+        Paint mark = new Paint(Paint.ANTI_ALIAS_FLAG);
+        mark.setStyle(Paint.Style.STROKE);
+        mark.setStrokeWidth(Math.max(2f, size / 120f));
+        mark.setColor(0xFF00E676);
+        new Canvas(crop).drawRect(r.left - left, r.top - top, r.right - left, r.bottom - top, mark);
+
+        Dialog dialog = new Dialog(this);
+        dialog.setTitle("Yakından bakış");
+        ImageView view = new ImageView(this);
+        view.setAdjustViewBounds(true);
+        view.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        view.setImageBitmap(crop);
+        view.setOnClickListener(v -> dialog.dismiss());
+        dialog.setContentView(view, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        dialog.show();
     }
 
     private void closeCamera() {
@@ -477,6 +667,10 @@ public class MainActivity extends Activity implements SensorEventListener {
     @Override
     public void onSensorChanged(SensorEvent e) {
         float x = e.values[0], y = e.values[1], z = e.values[2];
+        if (e.sensor.getType() == Sensor.TYPE_GYROSCOPE) {
+            turnRate = (float) Math.sqrt(x * x + y * y + z * z);
+            return;
+        }
         float g = (float) Math.sqrt(x * x + y * y + z * z);
         // Screen up means the back camera looks down; gravity then lies along the screen's normal.
         if (g > 1f) facingDown = z / g > FACING_DOWN;
@@ -495,6 +689,18 @@ public class MainActivity extends Activity implements SensorEventListener {
             return;
         }
         if (image == null) return;
+        if (frozen) {
+            image.close();
+            return;
+        }
+        if (turnRate > TOO_FAST) {
+            image.close();
+            main.post(() -> {
+                overlay.setBoxes(new ArrayList<>());
+                setStatus("Biraz daha yavaş gezdir — görüntü bulanıklaşıyor.");
+            });
+            return;
+        }
         if (!facingDown) {
             image.close();
             tracker.reset();
@@ -518,16 +724,25 @@ public class MainActivity extends Activity implements SensorEventListener {
         List<float[]> boxes = new ArrayList<>();
         for (Tracker.Track t : tracker.visible()) boxes.add(new float[]{t.left, t.top, t.right, t.bottom});
         boolean busy = detector.wasBusy();
+        float sum = 0f;
+        for (float v : gridY) sum += v;
+        boolean dark = sum / gridY.length < DARK && torchAvailable && !torchOn;
         main.post(() -> {
+            if (frozen) return;
             overlay.setBoxes(boxes);
-            if (busy && boxes.isEmpty()) {
+            if (dark && boxes.isEmpty()) {
+                setStatus("Ortam karanlık — feneri açarsan daha iyi görürüm.");
+            } else if (busy && boxes.isEmpty()) {
                 setStatus("Yüzey çok desenli — biraz yaklaş ya da hassasiyeti düşür.");
             } else if (boxes.isEmpty()) {
                 setStatus("Taranıyor… kamerayı yüzeyde yavaşça gezdir.");
             } else {
                 setStatus(boxes.size() == 1 ? "Bir şey bulundu! Yeşil kutuya bak." : boxes.size() + " şey bulundu! Yeşil kutulara bak.");
             }
-            if (fresh > 0) buzz();
+            if (fresh > 0) {
+                buzz();
+                if (soundOn && tone != null) tone.startTone(ToneGenerator.TONE_PROP_BEEP, 120);
+            }
         });
     }
 
